@@ -7,6 +7,15 @@
     <!-- Enable auxiliary cameras selector. -->
     <bool name="config_enableAuxCameras">false</bool>
 
+    <!-- Opt in to independent rear cameras for continuous zoom in ordinary photo mode.
+         Include every rear lens in this group, including the standalone main camera.
+         Leave empty when the logical multi-camera path works correctly. -->
+    <string-array name="config_physicalZoomCameraIds" />
+
+    <!-- Zero keeps the standard zoom range. A positive value opts into an advertised
+         extended range for the longest physical lens in ordinary photo mode. -->
+    <integer name="config_physicalZoomMaxRatio">0</integer>
+
     <!-- List of ID of auxiliary cameras that must be ignored by the app. -->
     <string-array name="config_ignoredAuxCameraIds">
         <!-- No camera is ignored by default. -->

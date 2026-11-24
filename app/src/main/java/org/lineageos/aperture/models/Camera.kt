@@ -7,6 +7,7 @@ package org.lineageos.aperture.models
 
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureRequest
 import android.os.Build
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -71,6 +72,17 @@ class Camera private constructor(
         cameraInfo.exposureState.exposureCompensationRange.toClosedRange<Int>()
 
     val intrinsicZoomRatio = cameraInfo.intrinsicZoomRatio
+
+    val zoomRatioRange = cameraInfo.zoomState.value?.let {
+        it.minZoomRatio..it.maxZoomRatio
+    }
+
+    val extendedMaxZoomRatio = runCatching {
+        camera2CameraInfo.getCameraCharacteristic(CameraCharacteristics.Key(
+            "org.codeaurora.qcamera3.platformCapabilities.ExtendedMaxZoom",
+            Float::class.javaObjectType,
+        ))
+    }.getOrNull()?.takeIf { it.isFinite() && it > 0f } ?: zoomRatioRange?.endInclusive ?: 1f
 
     private val imageCaptureCapabilities = ImageCapture.getImageCaptureCapabilities(cameraInfo)
 
@@ -277,6 +289,11 @@ class Camera private constructor(
     }.toSet()
 
     companion object {
+        val EXTENDED_MAX_ZOOM_KEY = CaptureRequest.Key(
+            "org.codeaurora.qcamera3.sessionParameters.ExtendedMaxZoom",
+            Int::class.javaObjectType,
+        )
+
         fun fromCameraX(
             cameraXCameraInfo: CameraInfo,
             extensionsManager: ExtensionsManager,

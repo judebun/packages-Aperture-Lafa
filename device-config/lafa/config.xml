@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: 2026 The LineageOS Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<resources>
+    <!-- Expose the standalone ultra-wide and telephoto camera selectors.
+         Telephoto ID 4 avoids the logical camera's preview exposure handoff. -->
+    <bool name="config_enableAuxCameras">true</bool>
+    <bool name="config_ignoreLogicalAuxCameras">true</bool>
+
+    <!-- Route ordinary photo zoom through the independent sensors, not logical ID 0. -->
+    <string-array name="config_physicalZoomCameraIds">
+        <item>2</item>
+        <item>3</item>
+        <item>4</item>
+    </string-array>
+    <integer name="config_physicalZoomMaxRatio">120</integer>
+
+    <!-- ID 2 duplicates the main sensor already exposed by logical ID 0. -->
+    <string-array name="config_ignoredAuxCameraIds">
+        <item>2</item>
+    </string-array>
+</resources>

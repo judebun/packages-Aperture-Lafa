@@ -10,6 +10,7 @@ import android.app.Application
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.ImageFormat
+import android.hardware.camera2.CaptureRequest
 import android.location.LocationManager
 import android.net.Uri
 import android.os.BatteryManager
@@ -18,9 +19,13 @@ import android.os.PowerManager
 import android.util.Log
 import android.view.OrientationEventListener
 import androidx.camera.core.AspectRatio
+import androidx.camera.camera2.interop.CaptureRequestOptions
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.CameraControl
 import androidx.camera.core.ExperimentalZeroShutterLag
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ZoomState
 import androidx.camera.extensions.ExtensionMode
 import androidx.camera.video.Quality
 import androidx.camera.video.Recording
@@ -60,6 +65,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import org.lineageos.aperture.ext.applicationContext
 import org.lineageos.aperture.ext.broadcastReceiverFlow
+import org.lineageos.aperture.ext.camera2CameraControl
 import org.lineageos.aperture.ext.flashMode
 import org.lineageos.aperture.ext.locationFlow
 import org.lineageos.aperture.ext.mapToRange
@@ -91,6 +97,7 @@ import org.lineageos.aperture.models.TimerMode
 import org.lineageos.aperture.qr.QrImageAnalyzer
 import org.lineageos.aperture.repositories.CameraRepository
 import org.lineageos.aperture.utils.CameraSoundsUtils
+import org.lineageos.aperture.utils.PhysicalCameraZoom
 import org.lineageos.aperture.utils.StorageUtils
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ExecutorService
@@ -234,7 +241,9 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
         cameraRepository.cameras,
         cameraMode,
     ) { cameras, cameraMode ->
-        cameras.filter { it.supportsCameraMode(cameraMode) }.groupBy(Camera::cameraFacing)
+        camerasForMode(cameras, cameraMode).filter {
+            it.supportsCameraMode(cameraMode)
+        }.groupBy(Camera::cameraFacing)
     }
         .flowOn(Dispatchers.IO)
         .stateIn(
@@ -264,7 +273,7 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
         camera,
         cameraMode,
     ) { cameras, camera, cameraMode ->
-        camera to cameras.filter {
+        camera to camerasForMode(cameras, cameraMode).filter {
             it.cameraFacing == camera.cameraFacing && it.supportsCameraMode(cameraMode)
         }
     }
@@ -487,13 +496,37 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
     /**
      * The current zoom state.
      */
-    val zoomState = cameraController.zoomState.asFlow()
+    private val nativeZoomState = cameraController.zoomState.asFlow()
         .flowOn(Dispatchers.IO)
         .stateIn(
             viewModelScope,
             started = SharingStarted.WhileSubscribed(),
             initialValue = null
         )
+
+    private val routedZoomTarget = MutableStateFlow<PhysicalCameraZoom.Target?>(null)
+    private var boundCameraId: String? = null
+    private var routedZoomSequence = 0L
+
+    val zoomState = combine(
+        nativeZoomState,
+        cameraConfiguration,
+        routedZoomTarget,
+    ) { nativeState, configuration, target ->
+        nativeState?.let { native ->
+            physicalZoomRouter(configuration)?.let { router ->
+                val globalRatio = target?.takeIf {
+                    it.cameraId == configuration.camera.cameraId
+                }?.globalZoomRatio ?: (native.zoomRatio * configuration.camera.intrinsicZoomRatio)
+                object : ZoomState {
+                    override fun getZoomRatio() = globalRatio
+                    override fun getMinZoomRatio() = router.minZoomRatio
+                    override fun getMaxZoomRatio() = router.maxZoomRatio
+                    override fun getLinearZoom() = router.linearZoomFromRatio(globalRatio)
+                }
+            } ?: native
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), null)
 
     val tapToFocusInfoState = cameraController.tapToFocusInfoState.asFlow()
         .flowOn(Dispatchers.IO)
@@ -1018,6 +1051,7 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
     fun selectCamera(
         camera: Camera,
     ) = updateConfiguration<CameraConfiguration> { cameraConfiguration ->
+        routedZoomTarget.value = null
         createInitialCameraConfiguration(
             camera = camera,
             cameraMode = cameraConfiguration.cameraMode,
@@ -1253,7 +1287,9 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
         val camera = when (cameraFacing) {
             CameraFacing.UNKNOWN -> null
             CameraFacing.FRONT -> cameraRepository.mainFrontCamera
-            CameraFacing.BACK -> cameraRepository.mainBackCamera
+            CameraFacing.BACK -> cameraForCycling[cameraFacing]?.firstOrNull {
+                it == cameraRepository.mainBackCamera
+            }
             CameraFacing.EXTERNAL -> null
         } ?: cameraForCycling[cameraFacing]?.firstOrNull() ?: error(
             "Camera with facing $cameraFacing not available"
@@ -1278,7 +1314,8 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
             }
 
             val camera = cameraConfiguration.camera.takeIf {
-                it.supportsCameraMode(cameraMode)
+                it.supportsCameraMode(cameraMode) &&
+                        camerasForMode(cameraRepository.cameras.first(), cameraMode).contains(it)
             } ?: getSuitableCamera(
                 cameraMode,
                 cameraConfiguration.camera.cameraFacing,
@@ -1543,19 +1580,18 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
      * @param zoomRatio The zoom ratio to apply
      */
     fun smoothZoom(zoomRatio: Float) {
+        val zoomState = zoomState.value ?: return
         val acquired = zoomGestureMutex.tryLock()
         if (!acquired) {
             return
         }
-
-        val zoomState = zoomState.value ?: return
 
         ValueAnimator.ofFloat(
             zoomState.zoomRatio,
             zoomRatio.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
         ).apply {
             addUpdateListener {
-                cameraController.setZoomRatio(it.animatedValue as Float)
+                setZoomRatio(it.animatedValue as Float)
             }
             addListener(
                 onEnd = {
@@ -1568,7 +1604,136 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
     /**
      * Reset the zoom to 1.0x (value relative to the lens, not of the FOV).
      */
-    fun resetZoom() = smoothZoom(1f)
+    fun resetZoom() = smoothZoom(
+        _cameraConfiguration.value?.takeIf { physicalZoomRouter(it) != null }
+            ?.camera?.intrinsicZoomRatio ?: 1f
+    )
+
+    fun setLinearZoom(linearZoom: Float) {
+        val router = physicalZoomRouter()
+        if (router == null) {
+            cameraController.setLinearZoom(linearZoom)
+        } else {
+            setZoomRatio(router.ratioFromLinearZoom(linearZoom))
+        }
+    }
+
+    fun onPinchToZoom(scaleFactor: Float) {
+        if (physicalZoomRouter() == null) {
+            cameraController.onPinchToZoom(scaleFactor)
+        } else if (scaleFactor.isFinite() && scaleFactor > 0f) {
+            (routedZoomTarget.value?.globalZoomRatio ?: zoomState.value?.zoomRatio)?.let {
+                setZoomRatio(it * scaleFactor)
+            }
+        }
+    }
+
+    private fun setZoomRatio(zoomRatio: Float) {
+        if (!zoomRatio.isFinite()) return
+        val configuration = _cameraConfiguration.value ?: return
+        val router = physicalZoomRouter(configuration)
+        if (router == null) {
+            cameraController.setZoomRatio(zoomRatio)
+            return
+        }
+        if (!canRestartCamera()) return
+
+        val target = router.target(zoomRatio)
+        val previousTarget = routedZoomTarget.value
+        routedZoomTarget.value = target
+        if (target.cameraId == configuration.camera.cameraId) {
+            applyRoutedZoom()
+        } else {
+            val camera = cameraRepository.physicalZoomCameras.first {
+                it.cameraId == target.cameraId
+            }
+            val changed = updateConfiguration<CameraConfiguration.Photo> {
+                createInitialCameraConfiguration(camera, CameraMode.PHOTO)
+            }
+            if (!changed) {
+                routedZoomTarget.value = previousTarget
+            } else {
+                Log.i(LOG_TAG, "Photo zoom route: ${configuration.camera.cameraId} -> " +
+                        "${target.cameraId}, global=${target.globalZoomRatio}, native=${target.zoomRatio}")
+            }
+        }
+    }
+
+    fun onCameraUnbound() {
+        boundCameraId = null
+        routedZoomSequence++
+    }
+
+    fun onCameraBound(configuration: CameraConfiguration): Boolean {
+        if (!isCurrentCameraConfiguration(configuration)) return false
+        boundCameraId = configuration.camera.cameraId
+        applyRoutedZoom()
+        return true
+    }
+
+    fun isCurrentCameraConfiguration(configuration: CameraConfiguration) =
+        _cameraConfiguration.value === configuration
+
+    fun isExtendedZoomEnabled(configuration: CameraConfiguration): Boolean {
+        val standardMax = configuration.camera.zoomRatioRange?.endInclusive ?: return false
+        val configuredMax = physicalZoomRouter(configuration)
+            ?.maxZoomRatioForCamera(configuration.camera.cameraId) ?: return false
+        return configuredMax > standardMax
+    }
+
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun applyRoutedZoom() {
+        val target = routedZoomTarget.value ?: return
+        val configuration = _cameraConfiguration.value ?: return
+        if (physicalZoomRouter(configuration) == null ||
+            configuration.camera.cameraId != target.cameraId || boundCameraId != target.cameraId) {
+            return
+        }
+        val sequence = ++routedZoomSequence
+        val future = if (isExtendedZoomEnabled(configuration)) {
+            // The validated vendor path accepts zoom beyond CameraX's standard range.
+            // Keep every tele zoom on this path so shrinking back clears the high zoom too.
+            val control = cameraController.camera2CameraControl ?: return
+            control.addCaptureRequestOptions(CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(Camera.EXTENDED_MAX_ZOOM_KEY, 1)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_ZOOM_RATIO, target.zoomRatio)
+                .build())
+        } else {
+            cameraController.setZoomRatio(target.zoomRatio)
+        }
+        future.addListener({
+            if (sequence != routedZoomSequence || boundCameraId != target.cameraId) {
+                return@addListener
+            }
+            try {
+                future.get()
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException ||
+                    e.cause is CameraControl.OperationCanceledException) {
+                    return@addListener
+                }
+                Log.w(LOG_TAG, "Unable to apply independent-camera zoom", e)
+                if (routedZoomTarget.value == target && boundCameraId == target.cameraId) {
+                    routedZoomTarget.value = null
+                }
+            }
+        }, ContextCompat.getMainExecutor(applicationContext))
+    }
+
+    private fun physicalZoomRouter(
+        configuration: CameraConfiguration? = _cameraConfiguration.value,
+    ): PhysicalCameraZoom? {
+        if (configuration !is CameraConfiguration.Photo ||
+            configuration.extensionMode != ExtensionMode.NONE ||
+            configuration.camera.cameraFacing != CameraFacing.BACK) return null
+        val cameras = cameraRepository.physicalZoomCameras
+        if (cameras.none { it == configuration.camera }) return null
+        return PhysicalCameraZoom(cameras.map { camera ->
+            val range = requireNotNull(camera.zoomRatioRange)
+            PhysicalCameraZoom.Lens(camera.cameraId, camera.intrinsicZoomRatio,
+                range.start, range.endInclusive, camera.extendedMaxZoomRatio)
+        }, overlaysRepository.physicalZoomMaxRatio)
+    }
 
     /**
      * Zoom in by a power of 2.
@@ -1631,7 +1796,7 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
         cameraMode: CameraMode,
         cameraFacing: CameraFacing,
     ): Camera? {
-        val compatibleCameras = cameraRepository.cameras.first()
+        val compatibleCameras = camerasForMode(cameraRepository.cameras.first(), cameraMode)
             .filter { camera ->
                 camera.supportsCameraMode(cameraMode)
             }
@@ -1639,6 +1804,15 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
         return compatibleCameras.firstOrNull { camera ->
             camera.cameraFacing == cameraFacing
         } ?: compatibleCameras.firstOrNull()
+    }
+
+    private fun camerasForMode(cameras: List<Camera>, cameraMode: CameraMode): List<Camera> {
+        val physicalCameras = cameraRepository.physicalZoomCameras
+        return if (cameraMode == CameraMode.PHOTO && physicalCameras.isNotEmpty()) {
+            cameras.filter { it.cameraFacing != CameraFacing.BACK } + physicalCameras
+        } else {
+            cameras
+        }
     }
 
     @androidx.annotation.OptIn(ExperimentalZeroShutterLag::class)
@@ -1853,6 +2027,12 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
 
             T::class.safeCast(currentCameraConfiguration)?.let {
                 val newCameraConfiguration = block(it)
+
+                if (newCameraConfiguration !is CameraConfiguration.Photo ||
+                    newCameraConfiguration.extensionMode != ExtensionMode.NONE ||
+                    newCameraConfiguration.camera.cameraId != routedZoomTarget.value?.cameraId) {
+                    routedZoomTarget.value = null
+                }
 
                 _cameraConfiguration.value = newCameraConfiguration
 

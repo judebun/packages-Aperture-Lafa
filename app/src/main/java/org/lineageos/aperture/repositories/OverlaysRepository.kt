@@ -24,6 +24,16 @@ class OverlaysRepository(private val context: Context) {
         fun getStringArray(id: Int): Array<String> = resources.getStringArray(getIdentifier(id))
 
         @Suppress("DiscouragedApi")
+        fun getStringArray(name: String): Array<String> = resources.getStringArray(
+            resources.getIdentifier(name, "array", packageName)
+        )
+
+        @Suppress("DiscouragedApi")
+        fun getInteger(name: String): Int = resources.getInteger(
+            resources.getIdentifier(name, "integer", packageName)
+        )
+
+        @Suppress("DiscouragedApi")
         private fun getIdentifier(id: Int) = resources.getIdentifier(
             context.resources.getResourceEntryName(id),
             context.resources.getResourceTypeName(id),
@@ -42,6 +52,23 @@ class OverlaysRepository(private val context: Context) {
      * @see R.bool.config_enableAuxCameras
      */
     val enableAuxCameras = getBoolean(R.bool.config_enableAuxCameras)
+
+    /** Standalone rear camera IDs to use for continuous zoom in ordinary photo mode. */
+    @Suppress("DiscouragedApi")
+    val physicalZoomCameraIds = (rroResources.firstNotNullOfOrNull {
+        runCatching { it.getStringArray("config_physicalZoomCameraIds") }.getOrNull()
+    } ?: context.resources.getIdentifier(
+        "config_physicalZoomCameraIds", "array", context.packageName
+    ).takeIf { it != 0 }?.let { context.resources.getStringArray(it) })?.toSet().orEmpty()
+
+    /** Optional global photo zoom ceiling, bounded by the long lens's advertised extended range. */
+    @Suppress("DiscouragedApi")
+    val physicalZoomMaxRatio = (rroResources.firstNotNullOfOrNull {
+        runCatching { it.getInteger("config_physicalZoomMaxRatio") }.getOrNull()
+    } ?: context.resources.getIdentifier(
+        "config_physicalZoomMaxRatio", "integer", context.packageName
+    ).takeIf { it != 0 }?.let { context.resources.getInteger(it) } ?: 0)
+        .takeIf { it > 0 }?.toFloat()
 
     /**
      * @see R.array.config_ignoredAuxCameraIds

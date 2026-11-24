@@ -239,7 +239,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 }
 
                 is ZoomGestureDetector.ZoomEvent.Move -> {
-                    viewModel.cameraController.onPinchToZoom(it.incrementalScaleFactor)
+                    viewModel.onPinchToZoom(it.incrementalScaleFactor)
                     handler.removeMessages(MSG_ON_PINCH_TO_ZOOM)
                     handler.sendMessageDelayed(handler.obtainMessage(MSG_ON_PINCH_TO_ZOOM), 500)
                 }
@@ -494,7 +494,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
 
         zoomLevel.onProgressChangedByUser = {
-            viewModel.cameraController.setLinearZoom(it)
+            viewModel.setLinearZoom(it)
         }
         zoomLevel.textFormatter = {
             "%.1fx".format(viewModel.zoomState.value?.zoomRatio)
@@ -1467,6 +1467,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         previewBlurView.isVisible = true
 
         // Unbind previous use cases
+        viewModel.onCameraUnbound()
         viewModel.cameraController.unbind()
 
         // Hide grid until preview is ready
@@ -1620,6 +1621,8 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         lifecycleScope.launch {
             viewModel.cameraController.initializationFuture.await()
 
+            if (!viewModel.isCurrentCameraConfiguration(cameraConfiguration)) return@launch
+
             val camera2CameraControl = viewModel.cameraController.camera2CameraControl ?: run {
                 Log.wtf(LOG_TAG, "Camera2CameraControl not available even with camera ready?")
                 return@launch
@@ -1628,7 +1631,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
             val camera2Options = cameraConfiguration.camera2Options
 
             // Set Camera2 CaptureRequest options
-            camera2CameraControl.setCaptureRequestOptions(CaptureRequestOptions.Builder()
+            val options = CaptureRequestOptions.Builder()
                 .setFrameRate(
                     when (cameraConfiguration) {
                         is CameraConfiguration.Video -> cameraConfiguration.videoFrameRate
@@ -1653,8 +1656,26 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 .setColorCorrectionAberrationMode(camera2Options.colorCorrectionAberrationMode)
                 .setDistortionCorrectionMode(camera2Options.distortionCorrectionMode)
                 .setHotPixelMode(camera2Options.hotPixelMode)
+                .apply {
+                    if (viewModel.isExtendedZoomEnabled(cameraConfiguration)) {
+                        setCaptureRequestOption(
+                            org.lineageos.aperture.models.Camera.EXTENDED_MAX_ZOOM_KEY, 1
+                        )
+                    }
+                }
                 .build()
-            )
+            try {
+                // This setter updates its option bundle synchronously. Do not gate zoom
+                // readiness on a frame acknowledgement that can be superseded during binding.
+                camera2CameraControl.setCaptureRequestOptions(options)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (viewModel.isCurrentCameraConfiguration(cameraConfiguration)) {
+                    Log.w(LOG_TAG, "Unable to initialize Camera2 options", e)
+                }
+                return@launch
+            }
+            viewModel.onCameraBound(cameraConfiguration)
         }
 
         // Restore settings that can be set on the fly

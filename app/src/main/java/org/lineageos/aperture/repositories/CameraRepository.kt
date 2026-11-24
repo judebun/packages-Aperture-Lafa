@@ -62,6 +62,33 @@ class CameraRepository(
             .mapToCamera()
     }
 
+    /** Opt-in photo-only camera group; fall back to normal camera selection if incomplete. */
+    val physicalZoomCameras by lazy {
+        val requestedIds = overlaysRepository.physicalZoomCameraIds
+        if (requestedIds.size < 2) {
+            emptyList()
+        } else {
+            val cameraInfos = cameraProvider.availableCameraInfos.filter {
+                Camera2CameraInfo.from(it).cameraId in requestedIds
+            }
+            if (cameraInfos.size != requestedIds.size || cameraInfos.any {
+                    it.lensFacing != CameraSelector.LENS_FACING_BACK ||
+                            it.physicalCameraInfos.size > 1
+                }) {
+                emptyList()
+            } else {
+                cameraInfos.mapToCamera().takeIf { cameras ->
+                    cameras.all {
+                        val range = it.zoomRatioRange
+                        range != null && range.start.isFinite() && range.start > 0f &&
+                                range.endInclusive.isFinite() && range.endInclusive >= range.start &&
+                                it.intrinsicZoomRatio.isFinite() && it.intrinsicZoomRatio > 0f
+                    }
+                }.orEmpty()
+            }
+        }
+    }
+
     val mainBackCamera by lazy {
         internalCameras.firstOrNull { camera ->
             camera.cameraFacing == CameraFacing.BACK
